@@ -1,0 +1,7 @@
+return {
+	_all = {
+		-- `:Open https://pandoc.org/MANUAL.html#running-pandoc-as-a-lua-interpreter`
+		-- busted must use pandoc as lua interpreter
+		lua = "pandoc lua",
+	},
+}
