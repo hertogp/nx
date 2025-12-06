@@ -219,6 +219,79 @@ rr.DNAME = {
   end,
 }
 
+local _keytype = {
+  [256] = 'ZSK',
+  [257] = 'KSK',
+}
+local _alg = {
+  -- TODO: generate module with numbers by download dns-sec-alg-numbers
+  -- `:Open https://www.rfc-editor.org/rfc/rfc4034#appendix-A.1`
+  -- `:Open https://www.iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml`
+  [0] = 'reserved',
+  [1] = 'RSAMD5',
+  [2] = 'DH',
+  [3] = 'DSA',
+  [4] = 'ECC',
+  [5] = 'RSASHA1',
+  [6] = 'DSA-NSEC3-SHA1',
+  [7] = 'RSASHA1-NSEC3-SHA1',
+  [8] = 'RSASHA256',
+  [9] = 'reserved',
+  [10] = 'RSASHA512',
+  [11] = 'reserved',
+  [12] = 'ECC-GOST',
+  [13] = 'ECDSAP256SHA256',
+  [14] = 'ECDSAP384SHA384',
+  [15] = 'ED25519',
+  [16] = 'ED448',
+  [17] = 'SM2SM3',
+  [23] = 'ECC-GOST12',
+  [252] = 'INDIRECT',
+  [253] = 'PRIVATEDNS',
+  [254] = 'PRIVATEOID',
+  [255] = 'reserved',
+}
+
+local function _calc_keytag(bin, algo)
+  -- test with dig example.com. DNSKEY +dnssec +multi @9.9.9.9
+  if 1 == algo then
+    local acc = unpack('>I3', bin, #bin - 2)
+    return acc >> 8
+  else
+    local acc, offset, bb = 0, 1, 0
+    repeat
+      bb, offset = unpack('>I2', bin, offset)
+      acc = acc + bb
+      print('bb', acc, bb, offset, #bin)
+    until #bin <= offset
+    acc = acc + (acc >> 16)
+    return acc & 0xffff
+  end
+end
+--- Sets `qres.rdata` = { (str), .. }
+rr.DNSKEY = {
+  -- `:Open https://www.rfc-editor.org/rfc/rfc4034#section-2`
+  -- `:Open https://www.rfc-editor.org/rfc/rfc4034#appendix-B` -- TODO: for keytag
+  decode = function(qres)
+    qres.rdata = {}
+    for i, bin in ipairs(qres) do
+      local flags, proto, algo, offset = unpack('>I2BB', bin)
+      local pubkey = sub(bin, offset)
+      local keytype = _keytype[flags] or 'other'
+      qres.rdata[i] = {
+        flags = flags,
+        proto = proto,
+        algo = algo,
+        pubkey = b64.encode(pubkey),
+        _keytype = keytype,
+        _keyid = _calc_keytag(bin, algo),
+        _alg = _alg[algo] or 'unknown',
+      }
+    end
+    return qres
+  end,
+}
+
 -- Sets `qres.rdata` = { keytag(num), algo(num), dtype(num), digest(str) }
 rr.DS = {
   -- `:Open https://www.rfc-editor.org/rfc/rfc4034#section-5`
