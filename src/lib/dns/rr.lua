@@ -1,15 +1,14 @@
---[[--- DNS.RR ---]]
-local dump = require 'dump'
+--[[--- DNS.rr ---]]
+-- local dump = require 'dump'
+local b64 = require 'base64'
+
 local sf = string.format
-local byte = string.byte
 local sub = string.sub
 local unpack = string.unpack
 
-print('DNS.RR ------------------------------------------------')
-
 --[[--- helpers ---]]
 
-local function addrev(t, f)
+local function addrev(t)
   -- it's not safe to add `table` keys while traversing `table`
   local copy = {}
   for k, v in pairs(t) do
@@ -20,14 +19,24 @@ local function addrev(t, f)
   end
 end
 
---[[--- parse helpers ---]]
+local char2hex = {}
+for c = 0, 255 do
+  char2hex[string.char(c)] = sf('%02X', c)
+end
+
+local function tohex(s) return (string.gsub(s, '.', char2hex)) end
+--[[--- parsers ---]]
 
 -- these parsers parse not the entire wire-form of a packet, but rather
--- the inidividual RRDATA binaries in `qres` as returned by unbound:resolve()
+-- the inidividual rrDATA binaries in `qres` as returned by unbound:resolve()
 
 local parse = {}
 
-function parse.charstr(bin, offset) return unpack('s1', bin, offset) end
+function parse.charstr(bin, offset)
+  -- <len-octect><len x octect ..>
+  offset = offset or 1
+  return unpack('s1', bin, offset)
+end
 
 function parse.domainname(bin, offset)
   -- `:Open https://www.rfc-editor.org/rfc/rfc1035#section-3.3`
@@ -44,6 +53,10 @@ function parse.ipv4(bin, offset)
   offset = offset or 1
   return sf('%d.%d.%d.%d', unpack('BBBB', bin, offset)), offset + 4
 end
+function parse.ipv6(bin, offset)
+  offset = offset or 1
+  return sf('%x:%x:%x:%x:%x:%x:%x:%x', unpack('>I2I2I2I2I2I2I2I2', bin, offset)), offset + 8
+end
 
 --[[--- TYPES ---]]
 
@@ -53,15 +66,23 @@ local TYPES = {
   CAA = 257,
   CNAME = 5,
   DNAME = 39,
+  DNSKEY = 48,
   DS = 43,
   MX = 15,
   NS = 2,
+  NSEC3PARAM = 51,
   PTR = 12,
+  RRSIG = 46,
   SOA = 6,
   TXT = 16,
 }
 -- add reverse mapping
 addrev(TYPES)
+
+setmetatable(TYPES, {
+  -- cater for wrong case and/or number as string
+  __index = function(t, key) return rawget(t, tonumber(key)) or rawget(t, string.upper(key)) end,
+})
 
 -- TYPES helper functions
 function TYPES.tostring(self, key)
@@ -70,29 +91,14 @@ function TYPES.tostring(self, key)
 end
 
 function TYPES.tonumber(self, key)
+  if nil == key then return nil end
   local n = tonumber(key)
   return rawget(self, n) and n or rawget(self, string.upper(key))
 end
 
-setmetatable(TYPES, {
-  -- cater for wrong case and/or number as string
-  __index = function(t, key) return rawget(t, tonumber(key)) or rawget(t, string.upper(key)) end,
-})
-
---[[--- RR ---]]
---  +------DNS message ---+
---  |        Header       |
---  +---------------------+
---  /       Question      / the question(s) for the name server
---  +---------------------+
---  /        Answer       / RRs answering the question
---  +---------------------+
---  /      Authority      / RRs pointing toward an authority
---  +---------------------+
---  /      Additional     / RRs holding additional information
---  +---------------------+
+--[[--- rr ---]]
 ---
---- and query reply:
+--- An RR has the following format:
 ---
 --   0  1  2  3  4  5  6  7  8  9  0 11 12 13 14 15
 -- +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
@@ -111,39 +117,82 @@ setmetatable(TYPES, {
 -- /                     RDATA                     / variable length binary
 -- /                                               /
 -- +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+--
+-- unbound:resolve(..) returns:
+-- {
+--    [1] = "&\3\16 \2\1\0\15\0\0\0\0\0\0\4�",
+--    [2] = ..
+--    havedata = true,
+--    n = 1,
+--    nxdomain = false,
+--    qclass = 1,
+--    qname = "rws.nl",
+--    qtype = 28,
+--    rcode = 0,
+--    secure = true,
+--
+--    -- rr.decode added
+--    rdata = {
+--        [1] = "2603:1020:201:f:0:0:0:4a0",
+--        [2] = "..",
+--    },
+--    rtype = "AAAA",
+-- }
+--
 
---- RR maps NAME -> {decode, encode} for lunbound query results
--- qresult is table with:
--- * sequence of individual RR's, and
--- * named fields (unfortunately field ttl is missing)
---   - havedata (boolean), n <num> of RR's in index qres[1..n]
---   - nxdomain (boolean), qclass (num) qname (str) , qtype (num), rcode (num)
---   - secure (boolean)
---   we add:
---   - rtype (str for qtype), rdata {} (decoded RDATA entries)
---   nb: `qres[x]` = raw binary, `qres.rdata[x]` = decoded to a map `{field_name=value}`
-local RR = {}
+-- unbound:resolve(name, qtype) -> qres with:
+-- - qname, qtype, qclass
+-- - havedata (true/false), n = num of entries qres[1]..[n]
+-- - nxdomain (true/false), secure (true/false)
+--
+-- rr.NAME.decode(qres) -> adds:
+-- - rname (str) = name of qtype
+-- - rdata ({..}) = list of translated RR-entries in qres or map
 
---- rdata = { ip = str }
-RR.A = {
+--- `rr.NAME` -> {`decode(qres)`, `encode(qres)`}
+--- where `qres` is a lunbound query result:
+-- * `qres[1..n]` = `{bin_1, .. , bin_n}`
+-- * `havedata` (boolean), n <num> of rr's in qres' sequence
+-- * `nxdomain` (boolean),
+-- * `qclass` (num)
+-- * `qname` (str) ,
+-- * `qtype` (num),
+-- * `rcode` (num)
+-- * `secure` (boolean)
+-- decoding adds:
+-- + `rtype` (str for qtype), rdata {} (decoded RDATA entries)
+-- + `rdata[1..n]` = { data_1, .., data_n }
+-- where
+-- * bin_x is the raw binary string of the RR, and
+-- * data_x is either a string for simple values *or* a table with k,v-pairs
+local rr = {}
+
+--- Sets `qres.rdata` = { (str), .. }
+rr.A = {
   -- `:Open https://www.rfc-editor.org/rfc/rfc1035#section-3.4.1`
   decode = function(qres)
-    qres.rdata = { ip = sf('%d.%d.%d.%d', unpack('BBBB', qres[1])) }
+    qres.rdata = {}
+    for i, bin in ipairs(qres) do
+      qres.rdata[i] = parse.ipv4(bin)
+    end
     return qres
   end,
 }
 
---- rdata = { ip = str }
-RR.AAAA = {
-  -- `:Open https://www.rfc-editor.org/rfc/rfc1035#section-3.4.1`
+--- Sets `qres.rdata` = { (str), .. }
+rr.AAAA = {
+  -- `:Open https://www.rfc-editor.org/rfc/rfc3596#section-2.2`
   decode = function(qres)
-    qres.rdata = { raw = qres[1] }
+    qres.rdata = {}
+    for i, bin in ipairs(qres) do
+      qres.rdata[i] = parse.ipv6(bin)
+    end
     return qres
   end,
 }
 
---- rdata = { flags = num, tag = str, val = str }
-RR.CAA = {
+--- Sets `qres.rdata` = { flags(num), tag(str), val(str) }
+rr.CAA = {
   -- `:Open https://www.rfc-editor.org/rfc/rfc8659#name-syntax`
   decode = function(qres)
     qres.rdata = {}
@@ -159,25 +208,32 @@ RR.CAA = {
   end,
 }
 
-RR.DNAME = {
-  -- `:Open `
+--- Sets `qres.rdata` = { (str) }
+rr.DNAME = {
+  -- `:Open https://www.rfc-editor.org/rfc/rfc6672.html#section-2.1`
   -- dig dname.dns.netmeister.org
   decode = function(qres)
-    qres.rdata = { raw = qres[1] }
+    local dname = parse.domainname(qres[1])
+    qres.rdata = { dname }
     return qres
   end,
 }
 
-RR.DS = {
-  -- `:Open `
+-- Sets `qres.rdata` = { keytag(num), algo(num), dtype(num), digest(str) }
+rr.DS = {
+  -- `:Open https://www.rfc-editor.org/rfc/rfc4034#section-5`
   decode = function(qres)
-    qres.rdata = { raw = qres[1] }
+    if false == qres.havedata then return nil, 'no data' end
+    local keytag, algo, dtype, offset = unpack('>I2BB', qres[1])
+    local digest = sub(qres[1], offset)
+    digest = tohex(digest)
+    qres.rdata = { keytag = keytag, algo = algo, dtype = dtype, digest = digest }
     return qres
   end,
 }
 
 --- rdata = { {pref = num, name = str}, .. }
-RR.MX = {
+rr.MX = {
   -- `:Open https://www.rfc-editor.org/rfc/rfc1035#section-3.3.9`
   decode = function(qres)
     qres.rdata = {}
@@ -192,8 +248,8 @@ RR.MX = {
   end,
 }
 
---- rdata = { str, str, .. }
-RR.NS = {
+--- Sets `qres.rdata` = { (str), .. }
+rr.NS = {
   -- `:Open https://www.rfc-editor.org/rfc/rfc1035#section-3.3.11`
   decode = function(qres)
     qres.rdata = {}
@@ -204,17 +260,47 @@ RR.NS = {
   end,
 }
 
---- rdata = { str }
-RR.PTR = {
+--- Sets `qres.rdata` = { (str), .. }
+rr.PTR = {
   -- `:Open https://www.rfc-editor.org/rfc/rfc1035#section-3.3.12`
   decode = function(qres)
-    qres.rdata = parse.domainname(qres[1])
+    qres.rdata = {}
+    for i, bin in ipairs(qres) do
+      qres.rdata[i] = parse.domainname(bin)
+    end
     return qres
   end,
 }
 
---- rdata = { mname(str), rname(str), serial(num), refresh(num), retry(num), expire(num) }
-RR.SOA = {
+--- Sets `qres.rdata` = {}
+rr.RRSIG = {
+  -- `:Open  https://www.rfc-editor.org/rfc/rfc4034#section-3`
+  decode = function(qres)
+    qres.rdata = {}
+    for i, bin in ipairs(qres) do
+      local name, signature
+      local type, algo, labels, ttl, notafter, notbefore, keytag, offset = unpack('>I2BBI4I4I4I2', bin)
+      name, offset = parse.domainname(bin, offset)
+      signature = unpack('z', bin .. '\0', offset)
+      print(tohex(signature))
+      qres.rdata[i] = {
+        type = type,
+        tname = TYPES:tostring(type),
+        algo = algo,
+        labels = labels,
+        ttl = ttl,
+        notafter = os.date('%Y%m%d%H%M%S', notafter),
+        notbefore = os.date('%Y%m%d%H%M%S', notbefore),
+        keytag = keytag,
+        name = name,
+        signature = b64.encode(signature),
+      }
+    end
+    return qres
+  end,
+}
+--- Sets `qres.rdata` = { mname(str), rname(str), serial(num), refresh(num), retry(num), expire(num) }
+rr.SOA = {
   -- `:Open https://www.rfc-editor.org/rfc/rfc1035#section-3.3.13`
   decode = function(qres)
     local bin = qres[1]
@@ -236,7 +322,7 @@ RR.SOA = {
 }
 
 --- rdata = { (str), .. }
-RR.TXT = {
+rr.TXT = {
   -- `:Open https://www.rfc-editor.org/rfc/rfc1035#section-3.3.14`
   decode = function(qres)
     qres.name = TYPES[qres.qtype]
@@ -255,8 +341,9 @@ local M = {
 }
 
 function M.decode(qres)
+  if nil == qres then return nil, 'no query result' end
   local rtype = TYPES:tostring(qres.qtype)
-  local codec = RR[rtype]
+  local codec = rr[rtype]
   if codec then
     qres.rtype = rtype
     return codec.decode(qres)
